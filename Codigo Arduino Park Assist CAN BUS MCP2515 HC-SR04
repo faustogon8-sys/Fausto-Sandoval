@@ -1,0 +1,284 @@
+//CÓDIGO ARDUINO TX (HC-SR04 + CAN SEND)
+
+#include <SPI.h>
+#include <mcp_can.h>
+
+#define CAN_CS 10
+#define CAN_INT 2
+
+MCP_CAN CAN0(CAN_CS);
+
+// Pines HC-SR04
+#define TRIG_PIN 6
+#define ECHO_PIN 7
+
+long duration;
+int distancia_cm = 0;
+
+int medirDistancia() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  int dist = duration * 0.034 / 2;
+
+  if (dist <= 0) dist = 200;
+  if (dist > 200) dist = 200;
+
+  return dist;
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  Serial.println("Iniciando CAN TX...");
+
+  while (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
+    Serial.println("Error CAN TX, reintentando...");
+    delay(500);
+  }
+
+  CAN0.setMode(MCP_NORMAL);
+  Serial.println("CAN TX listo!");
+}
+
+void loop() {
+
+  distancia_cm = medirDistancia();
+
+  // Estado
+  byte estado;
+  if (distancia_cm > 50) estado = 0;      // Seguro
+  else if (distancia_cm > 20) estado = 1; // Precaucion
+  else estado = 2;                        // Peligro
+
+  // Nivel sonoro simulado (0-100)
+  int sonido = map(distancia_cm, 100, 10, 0, 100);
+  sonido = constrain(sonido, 0, 100);
+
+  // Datos CAN
+  byte data[8];
+  data[0] = (byte)distancia_cm; // distancia
+  data[1] = (byte)sonido;       // nivel sonoro
+  data[2] = estado;             // estado
+  data[3] = 0;
+  data[4] = 0;
+  data[5] = 0;
+  data[6] = 0;
+  data[7] = 0;
+
+  // Enviar CAN ID 0x100
+  CAN0.sendMsgBuf(0x100, 0, 8, data);
+
+  Serial.print("TX -> Dist: ");
+  Serial.print(distancia_cm);
+  Serial.print(" cm | Sonido: ");
+  Serial.print(sonido);
+  Serial.print("% | Estado: ");
+  Serial.println(estado);
+
+  delay(100);
+}
+
+
+//CÓDIGO ARDUINO RX (RECIBE CAN + OLED + BUZZER)
+
+#include <SPI.h>
+#include <mcp_can.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------------- OLED ----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ---------------- CAN ----------------
+#define CAN_CS 10
+#define CAN_INT 2
+
+MCP_CAN CAN0(CAN_CS);
+
+// ---------------- BUZZER ----------------
+#define BUZZER_PIN 8
+
+// Variables recibidas
+int distancia = 0;
+int sonido = 0;
+byte estado = 0;
+
+unsigned long lastReceive = 0;
+unsigned long lastBeepTime = 0;
+bool beepOn = false;
+
+String estadoTexto(byte est) {
+  if (est == 0) return "SEGURO";
+  if (est == 1) return "PRECAUCION";
+  if (est == 2) return "PELIGRO";
+  return "ERROR";
+}
+
+void buzzerControl(byte est) {
+  unsigned long t = millis();
+
+  if (est == 0) {
+    noTone(BUZZER_PIN);
+    return;
+  }
+
+  // Precaucion beep lento
+  if (est == 1) {
+    if (t - lastBeepTime >= 500) {
+      lastBeepTime = t;
+      if (beepOn) {
+        noTone(BUZZER_PIN);
+        beepOn = false;
+      } else {
+        tone(BUZZER_PIN, 1200);
+        beepOn = true;
+      }
+    }
+  }
+
+  // Peligro beep rapido
+  if (est == 2) {
+    if (t - lastBeepTime >= 150) {
+      lastBeepTime = t;
+      if (beepOn) {
+        noTone(BUZZER_PIN);
+        beepOn = false;
+      } else {
+        tone(BUZZER_PIN, 2000);
+        beepOn = true;
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Error OLED");
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("RX PARK ASSIST");
+  display.println("Iniciando...");
+  display.display();
+  delay(1000);
+
+  // CAN init
+  Serial.println("Iniciando CAN RX...");
+
+  while (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) != CAN_OK) {
+    Serial.println("Error CAN RX, reintentando...");
+    delay(500);
+  }
+
+  CAN0.setMode(MCP_NORMAL);
+  pinMode(CAN_INT, INPUT);
+
+  Serial.println("CAN RX listo!");
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("CAN RX LISTO!");
+  display.display();
+  delay(500);
+}
+
+void loop() {
+
+  // Si hay mensaje CAN
+  if (!digitalRead(CAN_INT)) {
+
+    long unsigned int rxId;
+    unsigned char len = 0;
+    unsigned char rxBuf[8];
+
+    if (CAN0.readMsgBuf(&rxId, &len, rxBuf) == CAN_OK) {
+
+      if (rxId == 0x100 && len >= 3) {
+
+        distancia = rxBuf[0];
+        sonido = rxBuf[1];
+        estado = rxBuf[2];
+
+        lastReceive = millis();
+
+        Serial.print("RX <- Dist: ");
+        Serial.print(distancia);
+        Serial.print(" cm | Sonido: ");
+        Serial.print(sonido);
+        Serial.print("% | Estado: ");
+        Serial.println(estado);
+
+        // Mostrar OLED
+        display.clearDisplay();
+
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("PARK ASSIST CAN");
+
+        display.setCursor(0, 16);
+        display.print("Dist: ");
+        display.print(distancia);
+        display.println(" cm");
+
+        display.setCursor(0, 28);
+        display.print("Sonido: ");
+        display.print(sonido);
+        display.println(" %");
+
+        display.setCursor(0, 40);
+        display.print("Estado: ");
+        display.println(estadoTexto(estado));
+
+        if (estado == 2) {
+          display.setTextSize(2);
+          display.setCursor(0, 50);
+          display.println("STOP!");
+        }
+
+        display.display();
+      }
+    }
+  }
+
+  // Control buzzer
+  buzzerControl(estado);
+
+  // Si no recibe CAN en 2 segundos
+  if (millis() - lastReceive > 2000) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+
+    display.println("PARK ASSIST CAN");
+    display.println("----------------");
+    display.println("SIN SENAL CAN");
+    display.println("REVISA CABLES");
+    display.display();
+
+    noTone(BUZZER_PIN);
+    estado = 0;
+  }
+}
